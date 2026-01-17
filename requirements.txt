@@ -1,0 +1,10 @@
+# requirements.txt
+streamlit
+requests
+websocket-client
+pillow
+python-dotenv
+psutil
+safetensors
+torch
+torchvision
