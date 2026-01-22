@@ -52,7 +52,7 @@ def track_progress(prompt_id: str, client_id: str, console, progress, preview_ma
         if 'ws' in locals() and ws.connected:
             ws.close()
 
-def get_latest_image(prompt_id: str) -> (Image.Image | None, str | None, Path | None):
+def get_latest_image(prompt_id: str) -> tuple:
     """
     Récupère l'image finale, avec des tentatives répétées et une journalisation détaillée pour contrer la race condition.
     """
@@ -95,3 +95,37 @@ def get_latest_image(prompt_id: str) -> (Image.Image | None, str | None, Path | 
     print("--- Échec final de la récupération de l'image après plusieurs tentatives. ---")
     return None, None, None
 
+def poll_job_status(prompt_id: str) -> dict:
+    """
+    Poll the status of a ComfyUI job via the history API.
+    Returns a dict with status info.
+    """
+    try:
+        url = f"{Config.COMFYUI_URL}/history/{prompt_id}"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        history = response.json()
+
+        if prompt_id in history:
+            job_data = history[prompt_id]
+            status = job_data.get('status', {})
+
+            if status.get('status_str') == 'success':
+                return {'status': 'completed', 'progress': 1.0, 'data': job_data}
+            elif status.get('status_str') == 'error':
+                return {'status': 'failed', 'progress': 0.0, 'error': status.get('msg', 'Unknown error')}
+            else:
+                # Still running - check for progress in outputs
+                progress = 0.0
+                if 'outputs' in job_data:
+                    # Look for progress in any node outputs
+                    for node_output in job_data['outputs'].values():
+                        if isinstance(node_output, dict) and 'progress' in node_output:
+                            progress = node_output['progress']
+                            break
+                return {'status': 'running', 'progress': progress}
+        else:
+            # Job not in history yet, assume it's queued/running
+            return {'status': 'running', 'progress': 0.0}
+    except Exception as e:
+        return {'status': 'error', 'progress': 0.0, 'error': str(e)}

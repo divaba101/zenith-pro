@@ -1,4 +1,4 @@
-# modules/gallery.py (V18.2 - Correction finale de la dépréciation)
+# modules/gallery.py (V18.3 - Thumbnails et gestion d'erreurs)
 import streamlit as st
 import json
 from PIL import Image
@@ -64,28 +64,37 @@ def render():
     for idx, path in enumerate(images_to_display):
         with cols[idx % 3]:
             try:
-                st.image(str(path), use_column_width='always')
-                
+                # Utiliser la miniature si elle existe
+                thumb_path = Config.GALLERY_PATH / "thumbnails" / path.name if Config.GALLERY_PATH else None
+                image_path = str(thumb_path) if thumb_path and thumb_path.exists() else str(path)
+                st.image(image_path, use_column_width='always')
+
                 is_hidden = path.name in hidden_list
                 action_cols = st.columns(4)
-                
+
                 if action_cols[0].button("🗑️", key=f"del_{path.name}", help="Supprimer l'image"):
-                    path.unlink(); st.rerun()
-                
+                    if path.exists():
+                        path.unlink()
+                        if thumb_path and thumb_path.exists():
+                            thumb_path.unlink()
+                    st.rerun()
+
                 button_char, help_text = ("🔽", "Afficher") if is_hidden else ("🔼", "Masquer")
                 if action_cols[1].button(button_char, key=f"toggle_hide_{path.name}", help=help_text):
                     _unhide_image(path.name) if is_hidden else _hide_image(path.name)
                     st.rerun()
 
                 if action_cols[2].button("🔄", key=f"play_{path.name}", help="Rejouer dans le Studio"):
-                    img = Image.open(path)
-                    if 'prompt' in img.info:
-                        st.session_state['active_workflow'] = json.loads(img.info['prompt'])
-                        st.session_state['page'] = "Studio"
-                        st.rerun()
-                    else: st.warning("Aucun workflow trouvé dans les métadonnées.")
+                    if path.exists():
+                        img = Image.open(path)
+                        if 'prompt' in img.info:
+                            st.session_state['active_workflow'] = json.loads(img.info['prompt'])
+                            st.session_state['page'] = "Studio"
+                            st.rerun()
+                        else: st.warning("Aucun workflow trouvé dans les métadonnées.")
 
                 if action_cols[3].button("📝", key=f"log_{path.name}", help="Créer un log .txt"):
-                    _create_txt_log(path)
+                    if path.exists():
+                        _create_txt_log(path)
             except FileNotFoundError: st.rerun()
             except Exception as e: st.error(f"Erreur avec {path.name}: {e}")

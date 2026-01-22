@@ -5,6 +5,7 @@ websocket-client
 pillow
 python-dotenv
 psutil
+gputil
 safetensors
 torch
 torchvision

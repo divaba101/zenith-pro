@@ -2,11 +2,13 @@
 import streamlit as st
 import json
 import uuid
+import time
+import threading
 from pathlib import Path
 from datetime import datetime
 from config import Config
-from utils.api_comfy import send_to_comfy, track_progress, get_latest_image
-from utils.system import get_model_maps, update_workflow_paths, validate_workflow_models, copy_to_gallery
+from utils.api_comfy import send_to_comfy, track_progress, get_latest_image, poll_job_status
+from utils.system import get_model_maps, update_workflow_paths, validate_workflow_models, copy_to_gallery, copy_to_local_storage
 
 # (Listes et fonctions de base inchangées)
 COMMON_SAMPLERS = ["euler", "euler_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m_sde", "ddim", "lcm"]
@@ -65,7 +67,7 @@ def render_presets_popover(wf: dict):
                 with c2:
                     if st.button("🔌 Charger", key=f"load_{preset_path.name}", use_container_width=True):
                         with open(preset_path, 'r', encoding='utf-8') as f: loaded_wf = json.load(f)
-                        positive_nodes = {n for n in loaded_wf.values() if isinstance(n, dict) and "positive" in n.get("_meta", {}).get("title", "").lower()}
+                        positive_nodes = [n for n in loaded_wf.values() if isinstance(n, dict) and "positive" in n.get("_meta", {}).get("title", "").lower()]
                         for node in positive_nodes: node['inputs']['text'] = ""
                         st.session_state.active_workflow, st.session_state.workflow_version = loaded_wf, st.session_state.workflow_version + 1
                         st.toast(f"Preset '{preset_display_name}' chargé."); st.rerun()
@@ -170,50 +172,221 @@ def render_advanced_settings(wf, version):
                 inputs['cfg'] = st.slider("CFG", 0.0, 30.0, value=float(inputs['cfg']), step=0.5, key=f"widget_cfg_{version}")
         if latent_nodes:
             st.markdown("##### Dimensions de l'Image")
-            inputs, c1, c2 = list(latent_nodes.values())[0]['inputs'], *st.columns(2)
+            inputs, c1, c2, c3 = list(latent_nodes.values())[0]['inputs'], *st.columns(3)
             with c1: inputs['width'] = st.number_input("Largeur", value=inputs['width'], min_value=64, step=8, key=f"widget_width_{version}")
             with c2: inputs['height'] = st.number_input("Hauteur", value=inputs['height'], min_value=64, step=8, key=f"widget_height_{version}")
+            with c3: inputs['batch_size'] = st.slider("Lot", 1, 10, value=inputs['batch_size'], key=f"widget_batch_{version}")
+
+def initialize_generation_queue():
+    """Initialize the generation queue in session state."""
+    if 'generation_jobs' not in st.session_state:
+        st.session_state.generation_jobs = []
+    if 'job_counter' not in st.session_state:
+        st.session_state.job_counter = 0
+
+def update_job_statuses():
+    """Update the status of all running jobs."""
+    jobs = st.session_state.generation_jobs
+    running_jobs = [job for job in jobs if job['status'] == 'running']
+
+    for job in running_jobs:
+        status_info = poll_job_status(job['prompt_id'])
+        job['progress'] = status_info['progress']
+
+        if status_info['status'] == 'completed':
+            job['status'] = 'completed'
+            # Fetch the image
+            img_data, img_name, source_path = get_latest_image(job['prompt_id'])
+            if img_data:
+                job['image'] = img_data
+                job['image_name'] = img_name
+                job['source_path'] = source_path
+                # Show toast with thumbnail
+                st.toast(f"✅ Génération terminée: {img_name}", icon="🎉")
+                # Copy to destinations
+                if copy_to_gallery(source_path):
+                    st.toast(f"📁 Image copiée dans la galerie")
+                if copy_to_local_storage(source_path):
+                    st.toast(f"💾 Image copiée dans le stockage local")
+            else:
+                job['status'] = 'failed'
+                st.toast("❌ Échec de récupération de l'image", icon="⚠️")
+
+        elif status_info['status'] == 'failed':
+            job['status'] = 'failed'
+            st.toast(f"❌ Génération échouée: {status_info.get('error', 'Erreur inconnue')}", icon="⚠️")
+
+def start_pending_jobs():
+    """Start jobs that are queued if slots are available."""
+    jobs = st.session_state.generation_jobs
+    running_count = sum(1 for job in jobs if job['status'] == 'running')
+    max_concurrent = 5
+
+    queued_jobs = [job for job in jobs if job['status'] == 'queued']
+    for job in queued_jobs:
+        if running_count >= max_concurrent:
+            break
+
+        # Start the job
+        prompt_id = send_to_comfy(job['workflow'], st.session_state.client_id)
+        if prompt_id != "ERROR_CONNECTION":
+            job['prompt_id'] = prompt_id
+            job['status'] = 'running'
+            job['start_time'] = datetime.now()
+            running_count += 1
+        else:
+            job['status'] = 'failed'
+            st.toast("❌ Connexion à ComfyUI échouée", icon="⚠️")
+
+def add_generation_job(workflow, model_maps, turbo_mode):
+    """Add a new generation job to the queue."""
+    job_id = st.session_state.job_counter
+    st.session_state.job_counter += 1
+
+    # Prepare workflow (same as before)
+    final_wf = workflow.copy()
+
+    job = {
+        'id': job_id,
+        'workflow': final_wf,
+        'status': 'queued',
+        'progress': 0.0,
+        'prompt_id': None,
+        'start_time': None,
+        'image': None,
+        'image_name': None,
+        'source_path': None,
+        'turbo_mode': turbo_mode
+    }
+
+    st.session_state.generation_jobs.append(job)
+    start_pending_jobs()
+    st.toast(f"🎯 Génération ajoutée à la file (#{job_id})", icon="➕")
+
+def render_generation_queue():
+    """Render the generation queue with modern, clean styling."""
+    jobs = st.session_state.generation_jobs
+
+    if not jobs:
+        return
+
+    # Clean up completed jobs older than 5 minutes
+    now = datetime.now()
+    st.session_state.generation_jobs = [
+        job for job in jobs
+        if not (job['status'] == 'completed' and
+                job.get('start_time') and
+                (now - job['start_time']).seconds > 300)
+    ]
+
+    active_jobs = [job for job in st.session_state.generation_jobs
+                   if job['status'] in ['queued', 'running', 'completed']]
+
+    if not active_jobs:
+        return
+
+    st.markdown("---")
+    col_title, col_clear = st.columns([0.8, 0.2])
+    with col_title:
+        st.subheader("🎨 File de Génération")
+    with col_clear:
+        if st.button("🗑️ Vider", key="clear_completed", help="Supprimer les générations terminées"):
+            st.session_state.generation_jobs = [
+                job for job in st.session_state.generation_jobs
+                if job['status'] != 'completed'
+            ]
+            st.rerun()
+
+    for job in active_jobs:
+        with st.container(border=True):
+            col_info, col_progress = st.columns([0.7, 0.3])
+
+            with col_info:
+                status_emoji = {
+                    'queued': '⏳',
+                    'running': '⚡',
+                    'completed': '✅',
+                    'failed': '❌'
+                }.get(job['status'], '❓')
+
+                status_text = {
+                    'queued': 'En attente',
+                    'running': 'En cours',
+                    'completed': 'Terminée',
+                    'failed': 'Échouée'
+                }.get(job['status'], 'Inconnue')
+
+                st.markdown(f"**{status_emoji} Génération #{job['id']}** - {status_text}")
+
+                if job['status'] == 'running' and job.get('start_time'):
+                    elapsed = (datetime.now() - job['start_time']).seconds
+                    st.caption(f"Temps écoulé: {elapsed}s")
+
+                if job['status'] == 'completed' and job.get('image_name'):
+                    st.caption(f"Image: {job['image_name']}")
+
+            with col_progress:
+                if job['status'] == 'running':
+                    st.progress(job['progress'], text=".1%")
+                elif job['status'] == 'completed' and job.get('image'):
+                    # Show thumbnail
+                    st.image(job['image'], width=80, caption="")
+                elif job['status'] == 'failed':
+                    st.error("Échec")
 
 def render():
-    st.title("🎮 Studio Zenith Pro");
-    if 'client_id' not in st.session_state: st.session_state.client_id = str(uuid.uuid4())
-    if 'workflow_version' not in st.session_state: st.session_state.workflow_version = 0
-    
+    st.title("🎮 Studio Zenith Pro")
+    if 'client_id' not in st.session_state:
+        st.session_state.client_id = str(uuid.uuid4())
+    if 'workflow_version' not in st.session_state:
+        st.session_state.workflow_version = 0
+
+    initialize_generation_queue()
+    update_job_statuses()
+
     # On affiche le conteneur de détails en premier s'il est activé
     if 'show_preset_details' in st.session_state and st.session_state.show_preset_details:
         display_preset_details_container()
 
     model_maps = load_model_maps()
     col1, col2, col3 = st.columns([0.6, 0.2, 0.2])
-    with col1: files = sorted([f.name for f in Config.WF_DIR.glob("*.json")]); selected_wf_file = st.selectbox("Workflow de base", files, key="selectbox_workflow")
-    with col2: turbo_mode = st.toggle("🚀 MODE TURBO")
+    with col1:
+        files = sorted([f.name for f in Config.WF_DIR.glob("*.json")])
+        selected_wf_file = st.selectbox("Workflow de base", files, key="selectbox_workflow")
+    with col2:
+        turbo_mode = st.toggle("🚀 MODE TURBO")
     with col3:
-        if 'active_workflow' in st.session_state: render_presets_popover(st.session_state.active_workflow)
-    
+        if 'active_workflow' in st.session_state:
+            render_presets_popover(st.session_state.active_workflow)
+
     if st.session_state.get('last_wf') != selected_wf_file:
-        with open(Config.WF_DIR / selected_wf_file, 'r', encoding='utf-8') as f: st.session_state.active_workflow = json.load(f)
-        st.session_state.last_wf = selected_wf_file; st.session_state.workflow_version += 1; st.rerun()
-    
+        with open(Config.WF_DIR / selected_wf_file, 'r', encoding='utf-8') as f:
+            st.session_state.active_workflow = json.load(f)
+        st.session_state.last_wf = selected_wf_file
+        st.session_state.workflow_version += 1
+        st.rerun()
+
     if 'active_workflow' in st.session_state:
         wf_in_session, wf_version = st.session_state.active_workflow, st.session_state.workflow_version
         render_prompt_inputs(wf_in_session, wf_version)
         render_model_selectors(wf_in_session, model_maps, wf_version)
         render_advanced_settings(wf_in_session, wf_version)
         st.divider()
-        is_disabled = bool(validate_workflow_models(wf_in_session, model_maps))
-        if is_disabled: st.warning("Modèles manquants ! Corrigez la sélection dans le bloc 'Modèles du Workflow'.")
-        if st.button("🚀 LANCER LA GÉNÉRATION", type="primary", use_container_width=True, disabled=is_disabled):
-            _execute(wf_in_session, model_maps, turbo_mode)
+        validation_errors = validate_workflow_models(wf_in_session, model_maps)
+        if validation_errors:
+            st.error("❌ Problèmes détectés :")
+            for error in validation_errors:
+                st.write(f"• Modèle manquant : {error['name']} (type: {error['type']})")
+            st.info("Corrigez la sélection dans '📦 Modèles du Workflow'")
+            generate_disabled = True
+        else:
+            generate_disabled = False
 
-def _execute(workflow, model_maps, is_turbo):
-    preview_placeholder, console_placeholder, progress_placeholder = st.empty(), st.empty(), st.empty()
-    with st.spinner("Préparation et envoi..."): final_wf = workflow
-    prompt_id = send_to_comfy(final_wf, st.session_state.client_id)
-    if prompt_id != "ERROR_CONNECTION":
-        track_progress(prompt_id, st.session_state.client_id, console_placeholder, progress_placeholder, {})
-        img_data, img_name, source_path = get_latest_image(prompt_id)
-        if img_data:
-            preview_placeholder.image(img_data, caption=img_name, use_column_width='always')
-            if copy_to_gallery(source_path): st.toast(f"✅ Image '{img_name}' copiée dans la galerie !")
-        else: console_placeholder.error("Aucune image retournée. Vérifiez le terminal de ComfyUI.")
-    else: st.error("Connexion à ComfyUI échouée. Vérifiez le serveur et l'option --enable-cors.")
+        if st.button("🚀 LANCER LA GÉNÉRATION", type="primary", use_container_width=True, disabled=generate_disabled):
+            try:
+                add_generation_job(wf_in_session, model_maps, turbo_mode)
+            except Exception as e:
+                st.error(f"Erreur lors de l'ajout à la file : {e}")
+
+    # Render the generation queue
+    render_generation_queue()
